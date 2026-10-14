@@ -108,6 +108,17 @@ CUresult copyHostToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks
 CUresult copyDeviceToHost(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
 CUresult copyDeviceToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
 
+//! Per-task size at or above which copyHostToDevice / copyDeviceToHost may use the copy engines instead of the
+//! batched copy kernel (TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MIN_BYTES, default 4 MiB; 0 = any size, negative =
+//! never). Read once per process.
+size_t hostCopyDmaMinBytes() noexcept;
+//! Largest number of tasks per call that still takes the copy-engine path
+//! (TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_DMA_MAX_TASKS, default 8; 0 or negative = no limit). Read once per process.
+size_t hostCopyDmaMaxTasks() noexcept;
+//! Whether a host<->device call of numTasks tasks of numBytes each takes the copy-engine path in this process. Always
+//! false where host memory is registered in chunks (see HostMem::shouldUseChunkedRegistration()).
+bool useCopyEngineForHostCopy(size_t numBytes, size_t numTasks) noexcept;
+
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
     ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;
 
