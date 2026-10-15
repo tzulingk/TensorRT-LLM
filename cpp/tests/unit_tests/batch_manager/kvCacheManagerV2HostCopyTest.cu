@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +42,7 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -550,6 +552,164 @@ TEST_F(KvCacheManagerV2HostCopyTest, PathComparisonInfo)
 
     ASSERT_EQ(cudaEventDestroy(start), cudaSuccess);
     ASSERT_EQ(cudaEventDestroy(stop), cudaSuccess);
+}
+
+// Occupies every thread slot of the GPU for `cycles` clock ticks per block, launched back to back on its own stream, to
+// stand in for a compute phase that leaves no room for other CTAs.
+__global__ void spinKernel(long long cycles, int* sink)
+{
+    long long const start = clock64();
+    int acc = 0;
+    while (clock64() - start < cycles)
+    {
+        acc += 1;
+    }
+    if (acc == -1)
+    {
+        *sink = acc;
+    }
+}
+
+// TEMPORARY BENCHMARK (not for the PR): the same comparison while the SMs are saturated by a spin kernel, with the copy
+// stream at default and at the highest priority. Copy engines need no SM; the copier's CTAs must wait for a slot.
+TEST_F(KvCacheManagerV2HostCopyTest, PathComparisonUnderLoadInfo)
+{
+    ScopedEnv prefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "0");
+    ScopedEnv thp("TLLM_KV_CACHE_MANAGER_V2_THP", "1");
+
+    BatchedPageCopier const copier;
+    int const smCount = copier.topology().smCount;
+    int lowest = 0;
+    int highest = 0;
+    ASSERT_EQ(cudaDeviceGetStreamPriorityRange(&lowest, &highest), cudaSuccess);
+    cudaStream_t busy = nullptr;
+    cudaStream_t highPriority = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithPriority(&busy, cudaStreamNonBlocking, lowest), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithPriority(&highPriority, cudaStreamNonBlocking, highest), cudaSuccess);
+    CudaAllocation sink = allocateCuda(sizeof(int));
+    ASSERT_NE(sink.get(), nullptr);
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    ASSERT_EQ(cudaEventCreate(&start), cudaSuccess);
+    ASSERT_EQ(cudaEventCreate(&stop), cudaSuccess);
+
+    // Calibrate the spin: clock ticks per millisecond on this part.
+    constexpr long long kCalibrationCycles = 2'000'000;
+    ASSERT_EQ(cudaEventRecord(start, busy), cudaSuccess);
+    spinKernel<<<1, 32, 0, busy>>>(kCalibrationCycles, static_cast<int*>(sink.get()));
+    ASSERT_EQ(cudaEventRecord(stop, busy), cudaSuccess);
+    ASSERT_EQ(cudaEventSynchronize(stop), cudaSuccess);
+    float calibrationMs = 0.0F;
+    ASSERT_EQ(cudaEventElapsedTime(&calibrationMs, start, stop), cudaSuccess);
+    double const cyclesPerMs = kCalibrationCycles / static_cast<double>(calibrationMs);
+    std::cout << "PathComparisonUnderLoadInfo: smCount=" << smCount << " priorities " << lowest << ".." << highest
+              << " cyclesPerMs=" << cyclesPerMs << " copier ctas(d2h/h2d)=" << copier.config(CopyDirection::kD2H).ctas
+              << "/" << copier.config(CopyDirection::kH2D).ctas << std::endl;
+
+    struct Shape
+    {
+        size_t numBytes;
+        size_t numTasks;
+        char const* name;
+    };
+
+    for (Shape const shape : {Shape{kSsmStateBytes, 1, "ssm-state x1"}, Shape{kConvStateBytes, 12, "conv-state x12"}})
+    {
+        size_t const total = shape.numBytes * shape.numTasks;
+        HostMem host(roundUpToHostMemAlignment(total));
+        CudaAllocation device = allocateCuda(total);
+        ASSERT_NE(device.get(), nullptr);
+        std::memset(reinterpret_cast<void*>(host.address()), 0x3C, total);
+        auto const deviceBase = reinterpret_cast<MemAddress>(device.get());
+        std::vector<MMTask> hostToDevice;
+        std::vector<PageIndexPair> pairs;
+        for (size_t i = 0; i < shape.numTasks; ++i)
+        {
+            hostToDevice.push_back(MMTask{deviceBase + i * shape.numBytes, host.address() + i * shape.numBytes});
+            pairs.push_back(PageIndexPair{static_cast<int32_t>(i), static_cast<int32_t>(i)});
+        }
+        CudaAllocation devicePairs;
+        PageIndexPair const* pairPtr = pairs.data();
+        if (copier.pageIndexLocation() == PageIndexLocation::kDevice)
+        {
+            devicePairs = allocateCuda(pairs.size() * sizeof(PageIndexPair));
+            ASSERT_NE(devicePairs.get(), nullptr);
+            ASSERT_EQ(cudaMemcpy(devicePairs.get(), pairs.data(), pairs.size() * sizeof(PageIndexPair),
+                          cudaMemcpyHostToDevice),
+                cudaSuccess);
+            pairPtr = static_cast<PageIndexPair const*>(devicePairs.get());
+        }
+        PoolCopyArgs onboard{};
+        onboard.dstBase = static_cast<CUdeviceptr>(deviceBase);
+        onboard.srcBase = static_cast<CUdeviceptr>(host.address());
+        onboard.dstStride = shape.numBytes;
+        onboard.srcStride = shape.numBytes;
+        onboard.bytesPerPage = static_cast<uint32_t>(shape.numBytes);
+        onboard.pairs = pairPtr;
+        onboard.numPairs = static_cast<uint32_t>(shape.numTasks);
+
+        // Milliseconds per host->device copy on `copyStream` while `busy` runs blocks of `blockMs` each, every thread
+        // slot of every SM taken (8 x 256 threads per SM). blockMs 0 means no load.
+        auto msPerCopy = [&](double blockMs, cudaStream_t copyStream, auto&& issue) -> double
+        {
+            constexpr int kWarmup = 3;
+            constexpr int kIters = 10;
+            if (blockMs > 0.0)
+            {
+                auto const cycles = static_cast<long long>(blockMs * cyclesPerMs);
+                int const launches = static_cast<int>(400.0 / blockMs) + 1; // about 400 ms of load
+                for (int i = 0; i < launches; ++i)
+                {
+                    spinKernel<<<smCount * 8, 256, 0, busy>>>(cycles, static_cast<int*>(sink.get()));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10)); // let the load establish
+            }
+            for (int i = 0; i < kWarmup; ++i)
+            {
+                issue(copyStream);
+            }
+            EXPECT_EQ(cudaEventRecord(start, copyStream), cudaSuccess);
+            for (int i = 0; i < kIters; ++i)
+            {
+                issue(copyStream);
+            }
+            EXPECT_EQ(cudaEventRecord(stop, copyStream), cudaSuccess);
+            EXPECT_EQ(cudaEventSynchronize(stop), cudaSuccess);
+            float ms = 0.0F;
+            EXPECT_EQ(cudaEventElapsedTime(&ms, start, stop), cudaSuccess);
+            EXPECT_EQ(cudaStreamSynchronize(busy), cudaSuccess); // drain the remaining load before the next case
+            return static_cast<double>(ms) / kIters;
+        };
+        auto issueHelper = [&](cudaStream_t s)
+        {
+            EXPECT_EQ(
+                copyHostToDevice(hostToDevice, static_cast<ssize_t>(shape.numBytes), reinterpret_cast<CUstream>(s)),
+                CUDA_SUCCESS);
+        };
+        auto issueCopier
+            = [&](cudaStream_t s) { copier.launch(onboard, CopyDirection::kH2D, reinterpret_cast<CUstream>(s)); };
+
+        for (double const blockMs : {0.0, 0.1, 5.0})
+        {
+            for (int prio = 0; prio < 2; ++prio)
+            {
+                cudaStream_t const copyStream = prio == 0 ? mStream : highPriority;
+                double const helperMs = msPerCopy(blockMs, copyStream, issueHelper);
+                double const copierMs = msPerCopy(blockMs, copyStream, issueCopier);
+                std::cout << "PathComparisonUnderLoadInfo: " << shape.name << " h2d, load blocks " << blockMs
+                          << " ms, copy stream " << (prio == 0 ? "default" : "highest") << " priority: helpers["
+                          << (useCopyEngineForHostCopy(shape.numBytes) ? "copy-engine" : "kernel") << "] " << helperMs
+                          << " ms/copy (" << total / (helperMs * 1e-3) / 1e9 << " GB/s) | BatchedPageCopier["
+                          << (copier.kernelEnabled() ? "kernel" : "copy-engine") << "] " << copierMs << " ms/copy ("
+                          << total / (copierMs * 1e-3) / 1e9 << " GB/s)" << std::endl;
+            }
+        }
+    }
+
+    ASSERT_EQ(cudaEventDestroy(start), cudaSuccess);
+    ASSERT_EQ(cudaEventDestroy(stop), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(busy), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(highPriority), cudaSuccess);
 }
 
 } // namespace
