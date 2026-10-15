@@ -23,6 +23,7 @@
 // mid-process the tests pick sizes on both sides of the default and reach both branches that way.
 
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/batchedPageCopy.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/tllmException.h"
 
@@ -415,6 +416,137 @@ TEST_F(KvCacheManagerV2HostCopyTest, StateSlotBandwidthInfo)
     RecordProperty("path", copyEngine ? "copy-engine" : "kernel");
     RecordProperty("host_to_device_gb_per_s", std::to_string(h2d));
     RecordProperty("device_to_host_gb_per_s", std::to_string(d2h));
+
+    ASSERT_EQ(cudaEventDestroy(start), cudaSuccess);
+    ASSERT_EQ(cudaEventDestroy(stop), cudaSuccess);
+}
+
+// TEMPORARY BENCHMARK (not for the PR): event-to-event GB/s of the two entry points of this file against
+// BatchedPageCopier, the path StorageManager uses for hot<->host migrations on main, on the same shapes.
+TEST_F(KvCacheManagerV2HostCopyTest, PathComparisonInfo)
+{
+    ScopedEnv prefault("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", "0");
+    ScopedEnv thp("TLLM_KV_CACHE_MANAGER_V2_THP", "1");
+
+    BatchedPageCopier const copier;
+    auto const& topo = copier.topology();
+    std::cout << "PathComparisonInfo: coherentLink=" << topo.coherentLink << " linkGBs=" << topo.linkBandwidthGBs
+              << " smCount=" << topo.smCount << " hostNuma=" << topo.hostNumaId
+              << " kernelEnabled=" << copier.kernelEnabled()
+              << " ctas(d2h/h2d)=" << copier.config(CopyDirection::kD2H).ctas << "/"
+              << copier.config(CopyDirection::kH2D).ctas
+              << " inFlight(d2h/h2d)=" << copier.config(CopyDirection::kD2H).inFlightBytes << "/"
+              << copier.config(CopyDirection::kH2D).inFlightBytes << std::endl;
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    ASSERT_EQ(cudaEventCreate(&start), cudaSuccess);
+    ASSERT_EQ(cudaEventCreate(&stop), cudaSuccess);
+
+    struct Shape
+    {
+        size_t numBytes;
+        size_t numTasks;
+        char const* name;
+    };
+
+    for (Shape const shape : {Shape{kSsmStateBytes, 1, "ssm-state x1"}, Shape{kConvStateBytes, 12, "conv-state x12"},
+             Shape{kConvStateBytes, 1, "conv-state x1"}, Shape{kAttentionPageBytes, 140, "attention x140"},
+             Shape{kDefaultThreshold, 64, "4MiB x64"}})
+    {
+        size_t const total = shape.numBytes * shape.numTasks;
+        HostMem host(roundUpToHostMemAlignment(total));
+        CudaAllocation device = allocateCuda(total);
+        ASSERT_NE(device.get(), nullptr);
+        std::memset(reinterpret_cast<void*>(host.address()), 0x3C, total);
+        auto const deviceBase = reinterpret_cast<MemAddress>(device.get());
+
+        std::vector<MMTask> hostToDevice;
+        std::vector<MMTask> deviceToHost;
+        std::vector<PageIndexPair> pairs;
+        for (size_t i = 0; i < shape.numTasks; ++i)
+        {
+            hostToDevice.push_back(MMTask{deviceBase + i * shape.numBytes, host.address() + i * shape.numBytes});
+            deviceToHost.push_back(MMTask{host.address() + i * shape.numBytes, deviceBase + i * shape.numBytes});
+            pairs.push_back(PageIndexPair{static_cast<int32_t>(i), static_cast<int32_t>(i)});
+        }
+        CudaAllocation devicePairs;
+        PageIndexPair const* pairPtr = pairs.data();
+        if (copier.pageIndexLocation() == PageIndexLocation::kDevice)
+        {
+            devicePairs = allocateCuda(pairs.size() * sizeof(PageIndexPair));
+            ASSERT_NE(devicePairs.get(), nullptr);
+            ASSERT_EQ(cudaMemcpy(devicePairs.get(), pairs.data(), pairs.size() * sizeof(PageIndexPair),
+                          cudaMemcpyHostToDevice),
+                cudaSuccess);
+            pairPtr = static_cast<PageIndexPair const*>(devicePairs.get());
+        }
+        PoolCopyArgs onboard{};
+        onboard.dstBase = static_cast<CUdeviceptr>(deviceBase);
+        onboard.srcBase = static_cast<CUdeviceptr>(host.address());
+        onboard.dstStride = shape.numBytes;
+        onboard.srcStride = shape.numBytes;
+        onboard.bytesPerPage = static_cast<uint32_t>(shape.numBytes);
+        onboard.pairs = pairPtr;
+        onboard.numPairs = static_cast<uint32_t>(shape.numTasks);
+        PoolCopyArgs offload = onboard;
+        offload.dstBase = onboard.srcBase;
+        offload.srcBase = onboard.dstBase;
+
+        auto timeGbPerSec = [&](auto&& issue) -> double
+        {
+            constexpr int kWarmup = 3;
+            constexpr int kIters = 10;
+            for (int i = 0; i < kWarmup; ++i)
+            {
+                issue();
+            }
+            EXPECT_EQ(cudaEventRecord(start, mStream), cudaSuccess);
+            for (int i = 0; i < kIters; ++i)
+            {
+                issue();
+            }
+            EXPECT_EQ(cudaEventRecord(stop, mStream), cudaSuccess);
+            EXPECT_EQ(cudaEventSynchronize(stop), cudaSuccess);
+            float ms = 0.0F;
+            EXPECT_EQ(cudaEventElapsedTime(&ms, start, stop), cudaSuccess);
+            return static_cast<double>(total) * kIters / (static_cast<double>(ms) * 1e-3) / 1e9;
+        };
+
+        double const helperH2d = timeGbPerSec(
+            [&]
+            {
+                EXPECT_EQ(copyHostToDevice(
+                              hostToDevice, static_cast<ssize_t>(shape.numBytes), reinterpret_cast<CUstream>(mStream)),
+                    CUDA_SUCCESS);
+            });
+        double const helperD2h = timeGbPerSec(
+            [&]
+            {
+                EXPECT_EQ(copyDeviceToHost(
+                              deviceToHost, static_cast<ssize_t>(shape.numBytes), reinterpret_cast<CUstream>(mStream)),
+                    CUDA_SUCCESS);
+            });
+        double const copierH2d
+            = timeGbPerSec([&] { copier.launch(onboard, CopyDirection::kH2D, reinterpret_cast<CUstream>(mStream)); });
+        double const copierD2h
+            = timeGbPerSec([&] { copier.launch(offload, CopyDirection::kD2H, reinterpret_cast<CUstream>(mStream)); });
+
+        // Correctness of the copier path on this layout: device <- host (0x3C) after a 0xEE fill.
+        ASSERT_EQ(cudaMemsetAsync(device.get(), 0xEE, total, mStream), cudaSuccess);
+        copier.launch(onboard, CopyDirection::kH2D, reinterpret_cast<CUstream>(mStream));
+        std::vector<unsigned char> readBack(total);
+        ASSERT_EQ(cudaMemcpyAsync(readBack.data(), device.get(), total, cudaMemcpyDeviceToHost, mStream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        bool const copierOk = std::all_of(readBack.begin(), readBack.end(), [](unsigned char v) { return v == 0x3C; });
+
+        std::cout << "PathComparisonInfo: " << shape.name << " (" << shape.numTasks << " x " << shape.numBytes
+                  << " B): helpers[" << (useCopyEngineForHostCopy(shape.numBytes) ? "copy-engine" : "kernel")
+                  << "] h2d " << helperH2d << " GB/s, d2h " << helperD2h << " GB/s | BatchedPageCopier["
+                  << (copier.kernelEnabled() ? "kernel" : "copy-engine") << "] h2d " << copierH2d << " GB/s, d2h "
+                  << copierD2h << " GB/s, bytes " << (copierOk ? "ok" : "MISMATCH") << std::endl;
+        EXPECT_TRUE(copierOk) << shape.name;
+    }
 
     ASSERT_EQ(cudaEventDestroy(start), cudaSuccess);
     ASSERT_EQ(cudaEventDestroy(stop), cudaSuccess);
