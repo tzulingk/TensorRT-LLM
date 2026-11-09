@@ -5891,7 +5891,11 @@ class TestRetention(TestKVCacheManagerV2):
         cache.close()
         self.caches.remove(cache)
 
-        self._apply_memory_pressure()
+        # Claim every free page and both committed ones, so the eviction drops the leaf block
+        # and then its parent.
+        free = self.manager.get_storage_statistics(GPU_LEVEL)[0].free
+        pressure = self._cache([])
+        self.assertTrue(pressure.resize((free + len(page_indices)) * tokens_per_block))
         self.assertEqual({level for level, _ in reported}, {GPU_LEVEL})
         victims = [page for _, pages in reported for page in pages]
         self.assertEqual(
@@ -5910,6 +5914,42 @@ class TestRetention(TestKVCacheManagerV2):
         self.caches.remove(cache)
         self._apply_memory_pressure()
         self.assertEqual(reported, [])
+
+    def test_victim_hook_sees_the_subtree_a_dropped_prefix_page_removes(self) -> None:
+        self._prepare_retention()
+        reported: list[tuple[int, list[tuple[bytes, int, int, int]]]] = []
+        self.manager.set_victim_hook(lambda level, pages: reported.append((level, list(pages))))
+        tokens_per_block = self.cfg.tokens_per_block
+        prompt = list(range(1, 2 * tokens_per_block + 1))
+        keys = sequence_to_blockchain_keys(tokens_per_block, ReuseScope(), prompt)
+        next(keys)  # the root key labels no block
+        block_keys = [key for _, key in keys]
+        # The first block is the cheaper one to evict, so the eviction drops the parent and,
+        # with it, the child the parent's prefix covers.
+        config = KvCacheRetentionConfig(
+            [
+                KvCacheRetentionConfig.TokenRangeRetentionConfig(0, tokens_per_block, 10),
+                KvCacheRetentionConfig.TokenRangeRetentionConfig(tokens_per_block, None, 90),
+            ]
+        )
+        cache = self._cache(prompt, config)
+        page_indices = list(cache.get_base_page_indices(0))[:2]
+        cache.close()
+        self.caches.remove(cache)
+
+        self._apply_memory_pressure()
+        self.assertEqual(len(reported), 1)
+        level, victims = reported[0]
+        self.assertEqual(level, GPU_LEVEL)
+        self.assertEqual(
+            sorted(victims),
+            sorted(
+                (key, 0, int(page_index), tokens_per_block)
+                for key, page_index in zip(block_keys, page_indices)
+            ),
+        )
+        probe = self._new_cache(prompt)
+        self.assertEqual(probe.num_committed_tokens, 0)
 
     def test_page_priorities_reject_invalid_layer_groups(self) -> None:
         self._prepare_retention()
