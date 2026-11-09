@@ -37,7 +37,18 @@ To implement a custom KV connector, you need to implement both the scheduler and
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+)
 
 import torch
 
@@ -254,6 +265,17 @@ class KvCacheConnectorWorker(ABC):
         Args:
             kv_cache_tensor: The contiguous KV cache tensor.
         """
+
+    def attach_kv_cache_managers(self, managers: Sequence[Tuple[object, int]]) -> None:
+        """
+        Called once the KV cache layout is registered, with the managers behind it.
+
+        Each entry is a ``KVCacheManagerV2`` and the layer-group id in the
+        registered layout that its layer group 0 maps to. A connector that needs
+        a manager itself, for instance to see pages as they are dropped, keeps it
+        here. The default ignores them.
+        """
+        return
 
     def register_kv_cache_layout(self, layout: "KvCacheLayout") -> None:
         """
@@ -536,6 +558,15 @@ class KvCacheConnectorScheduler(ABC):
                 "cannot share one list."
             )
         self.update_state_after_alloc(request, block_ids_by_layer_group[0])
+
+    def attach_kv_cache_managers(self, managers: Sequence[Tuple[object, int]]) -> None:
+        """
+        Called with the managers behind the registered layout, on the leader.
+
+        See ``KvCacheConnectorWorker.attach_kv_cache_managers``. The default
+        ignores them.
+        """
+        return
 
     def wait_for_initialization(self):
         """
@@ -1630,6 +1661,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def layer_post_hook(self, module, *args):
         self.worker.save_kv_layer(module.layer_idx, torch.cuda.current_stream())
+
+    def attach_kv_cache_managers(self, managers: Sequence[Tuple[object, int]]) -> None:
+        """Hand the KV cache managers behind the registered layout to both halves."""
+        self.worker.attach_kv_cache_managers(managers)
+        if self.scheduler is not None:
+            self.scheduler.attach_kv_cache_managers(managers)
 
     def wait_for_initialization(self):
         if self.scheduler is not None:

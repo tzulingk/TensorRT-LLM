@@ -1802,6 +1802,9 @@ class PyExecutor:
                 self.kv_connector_manager.warn_flat_scheduler_under_swa(window)
                 self.kv_connector_manager.worker.register_kv_cache_layout(
                     layout)
+                self.kv_connector_manager.attach_kv_cache_managers([
+                    (self.kv_cache_manager, 0)
+                ])
             else:
                 kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
                 self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
