@@ -5877,6 +5877,40 @@ class TestRetention(TestKVCacheManagerV2):
             [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, priority, duration)]
         )
 
+    def test_victim_hook_sees_each_page_eviction_drops(self) -> None:
+        self._prepare_retention()
+        reported: list[tuple[int, list[tuple[bytes, int, int, int]]]] = []
+        self.manager.set_victim_hook(lambda level, pages: reported.append((level, list(pages))))
+        tokens_per_block = self.cfg.tokens_per_block
+        prompt = list(range(1, 2 * tokens_per_block + 1))
+        keys = sequence_to_blockchain_keys(tokens_per_block, ReuseScope(), prompt)
+        next(keys)  # the root key labels no block
+        block_keys = [key for _, key in keys]
+        cache = self._cache(prompt)
+        page_indices = list(cache.get_base_page_indices(0))[:2]
+        cache.close()
+        self.caches.remove(cache)
+
+        self._apply_memory_pressure()
+        self.assertEqual({level for level, _ in reported}, {GPU_LEVEL})
+        victims = [page for _, pages in reported for page in pages]
+        self.assertEqual(
+            sorted(victims),
+            sorted(
+                (key, 0, int(page_index), tokens_per_block)
+                for key, page_index in zip(block_keys, page_indices)
+            ),
+        )
+
+        self._close_caches()
+        reported.clear()
+        self.manager.set_victim_hook(None)
+        cache = self._cache(prompt)
+        cache.close()
+        self.caches.remove(cache)
+        self._apply_memory_pressure()
+        self.assertEqual(reported, [])
+
     def test_page_priorities_reject_invalid_layer_groups(self) -> None:
         self._prepare_retention()
         for num_tokens in (0, 4):

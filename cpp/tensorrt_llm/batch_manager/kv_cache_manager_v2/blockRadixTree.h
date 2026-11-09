@@ -330,6 +330,10 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     // Mirrors Python's Block._adopt_pages_from().
     void adoptPagesFrom(Block& other);
 
+    //! Whether unlinking `block`'s page of `lc` removes the block's subtree from the tree,
+    //! dropping every page in it.
+    static bool pageUnlinkRemovesSubtree(Block const& block, LifeCycle const& lc);
+
     // Clear stale tree nodes after a lifecycle page has been unlinked.
     // Returns detached blocks that must stay alive until cleanup completes.
     static std::vector<SharedPtr<Block>> clearStaleBlocksAfterPageUnlink(

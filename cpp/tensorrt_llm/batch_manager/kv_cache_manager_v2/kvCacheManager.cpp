@@ -492,6 +492,7 @@ void KvCacheManager::shutdown()
     _checkNoLivingKvCaches("shutdown()");
     clearReusableBlocks();
     TLLM_CHECK_DEBUG(mStorage);
+    mStorage->setVictimHook({});
 
     // Post-condition: after clearing all reusable blocks and with no active KvCaches,
     // no evictable pages should remain.
@@ -505,6 +506,14 @@ void KvCacheManager::shutdown()
 
     mStorage->destroy();
     mShutDown = true;
+}
+
+void KvCacheManager::setVictimHook(VictimHook hook)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    TLLM_CHECK_DEBUG(mStorage);
+    mStorage->setVictimHook(std::move(hook));
 }
 
 void KvCacheManager::clearReusableBlocks()

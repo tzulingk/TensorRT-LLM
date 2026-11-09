@@ -37,6 +37,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -996,13 +997,16 @@ void StorageManager::forceEvict(
     if (isLastLevel(level))
     {
         // Last level: all evicted pages must be DROPPABLE (they get dropped, not migrated).
+        std::vector<Page*> dropped;
         for (auto const& pages : evicted)
         {
             for (auto const& page : pages)
             {
                 TLLM_CHECK_DEBUG_WITH_INFO(page->status() == PageStatus::DROPPABLE, "Corrupted eviction controller");
+                dropped.push_back(page.get());
             }
         }
+        reportVictims(level, dropped);
         if (dropRecorder)
         {
             for (auto const& pages : evicted)
@@ -1163,6 +1167,18 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     auto evicted = ctrl.evict(numToEvict);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
     TypedVec<LifeCycleId, std::vector<SharedPtr<Page>>> acceptedPages(numLifeCycles());
+    if (isLast && mVictimHook)
+    {
+        std::vector<Page*> dropped;
+        for (auto const& pages : evicted)
+        {
+            for (auto const& page : pages)
+            {
+                dropped.push_back(page.get());
+            }
+        }
+        reportVictims(lvlId, dropped);
+    }
 
     auto acceptFallenPages = [&](PoolGroupIndex pgIdx, SlotCount count)
     {
@@ -1298,12 +1314,88 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             }
         }
     }
+    if (mVictimHook)
+    {
+        std::vector<Page*> dropped;
+        for (auto const& pages : belowOffloadThreshold)
+        {
+            for (auto const& page : pages)
+            {
+                dropped.push_back(page.get());
+            }
+        }
+        reportVictims(kHotLevel, dropped);
+    }
     rescheduleEvictedPagesOnFailure.cancel();
     if (dropRecorder)
         for (auto const& pages : belowOffloadThreshold)
             if (!pages.empty())
                 dropRecorder(pages, kHotLevel);
     restoreBelowThreshold.cancel();
+}
+
+void StorageManager::setVictimHook(VictimHook hook)
+{
+    mVictimHook = std::move(hook);
+}
+
+void StorageManager::reportVictims(CacheLevel level, std::vector<Page*> const& evicted) const
+{
+    if (!mVictimHook || evicted.empty())
+    {
+        return;
+    }
+    std::unordered_set<Page const*> seen;
+    std::vector<VictimPage> victims;
+    auto const add = [&](Page const& page)
+    {
+        if (!seen.insert(&page).second || !page.isCommitted() || page.cacheLevel != level || !page.hasValidSlot())
+        {
+            return;
+        }
+        auto const& committed = static_cast<CommittedPage const&>(page);
+        if (committed.block == nullptr)
+        {
+            return;
+        }
+        // The hook reads the bytes from a stream of its own, so the write that produced them, a
+        // commit or a migration, has to have landed.
+        page.readyEvent.synchronize();
+        victims.push_back(VictimPage{
+            committed.block->key, page.lifeCycle, slotIdToPageIndexValue(page.slotId()), committed.numTokensInBlock});
+    };
+    for (Page const* page : evicted)
+    {
+        add(*page);
+        Block const* const block = page->isCommitted() ? static_cast<CommittedPage const*>(page)->block : nullptr;
+        if (block == nullptr || !Block::pageUnlinkRemovesSubtree(*block, getLifeCycle(page->lifeCycle)))
+        {
+            continue;
+        }
+        // Dropping this page removes the block's subtree, which releases the pages of every life cycle
+        // there without passing through eviction.
+        std::vector<Block const*> pending{block};
+        while (!pending.empty())
+        {
+            Block const* const node = pending.back();
+            pending.pop_back();
+            for (CommittedPage const* other : node->storage)
+            {
+                if (other != nullptr)
+                {
+                    add(*other);
+                }
+            }
+            for (auto const& entry : node->next)
+            {
+                pending.push_back(entry.second.get());
+            }
+        }
+    }
+    if (!victims.empty())
+    {
+        mVictimHook(level, victims);
+    }
 }
 
 // ---------------------------------------------------------------------------

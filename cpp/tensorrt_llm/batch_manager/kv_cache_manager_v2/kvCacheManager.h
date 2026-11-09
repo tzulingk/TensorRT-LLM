@@ -165,6 +165,11 @@ public:
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
 
+    //! Have `hook` see each committed page before eviction drops it, or stop with an empty hook.
+    //! It runs inside the eviction, under the API lock, with the page's bytes complete, and must
+    //! copy whatever it keeps before returning. Clearing reusable blocks does not call it.
+    void setVictimHook(VictimHook hook);
+
     // ---- KvCache creation -------------------------------------------------
 
     // Create a new KvCache. Returned cache is SUSPENDED; call resume() with a stream.

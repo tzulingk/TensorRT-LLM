@@ -101,6 +101,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
+    sequence_to_blockchain_keys,
     typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
@@ -8615,6 +8616,24 @@ class KVCacheManagerV2(BaseResourceManager):
             ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
             input_tokens,
         )
+
+    def reuse_block_keys(self, req: LlmRequest) -> list[bytes]:
+        """Radix-tree keys of the full blocks a lookup for *req* would match.
+
+        Built from the same evidence tokens and reuse scope the request's own
+        lookup hands the radix tree, so a key here names the block the tree
+        commits for that prefix. A connector that keeps pages the tree drops
+        names them by these keys.
+        """
+        tokens = self._context_reuse_tokens(req)
+        scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
+        keys = sequence_to_blockchain_keys(self.tokens_per_block, scope, tokens)
+        next(keys, None)  # the root key labels no block
+        return [key for block_tokens, key in keys if len(block_tokens) == self.tokens_per_block]
+
+    def set_victim_hook(self, hook) -> None:
+        """Forward to the native manager's `set_victim_hook`."""
+        self.impl.set_victim_hook(hook)
 
     def probe_first_new_block_key(self, req: LlmRequest) -> bytes | None:
         """Key of the first block whose pages *req* would commit, or None.

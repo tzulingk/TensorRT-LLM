@@ -497,6 +497,39 @@ static nb::bytes digestBytes(kv::Digest const& digest)
     return nb::bytes(reinterpret_cast<char const*>(digest.data()), digest.size());
 }
 
+//! Adapt a Python victim hook, or None, to the native one. The hook is called with the cache level
+//! and a list of `(block_key, life_cycle_id, page_index, num_tokens)` tuples.
+static kv::VictimHook castVictimHook(nb::object hook)
+{
+    if (hook.is_none())
+    {
+        return {};
+    }
+    if (!PyCallable_Check(hook.ptr()))
+    {
+        throw std::invalid_argument("victim hook must be callable or None");
+    }
+    // A later set_victim_hook or shutdown drops the hook with the GIL released, so the last
+    // reference is released through a deleter that takes it.
+    std::shared_ptr<nb::object> owned(new nb::object(std::move(hook)),
+        [](nb::object* object)
+        {
+            nb::gil_scoped_acquire acquire;
+            delete object;
+        });
+    return [owned = std::move(owned)](kv::CacheLevel level, std::vector<kv::VictimPage> const& pages)
+    {
+        nb::gil_scoped_acquire acquire;
+        nb::list items;
+        for (auto const& page : pages)
+        {
+            items.append(
+                nb::make_tuple(digestBytes(page.blockKey), page.lifeCycle.value(), page.pageIndex, page.numTokens));
+        }
+        (*owned)(level.value(), items);
+    };
+}
+
 static kv::Digest castDigest(nb::handle value)
 {
     if (!nb::isinstance<nb::bytes>(value))
@@ -3442,6 +3475,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("reuse_scope"), nb::arg("input_tokens"), nb::arg("target"))
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "set_victim_hook",
+            [](kv::KvCacheManager& self, nb::object hook)
+            {
+                kv::VictimHook nativeHook = castVictimHook(std::move(hook));
+                nb::gil_scoped_release release;
+                self.setVictimHook(std::move(nativeHook));
+            },
+            nb::arg("hook").none(),
+            "Have `hook(cache_level, pages)` see each committed page before eviction drops it, or "
+            "stop with None. `pages` lists `(block_key, life_cycle_id, page_index, num_tokens)`. The "
+            "hook runs inside the eviction, under the manager's lock, and must copy any page it keeps "
+            "before returning.")
         .def(
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,

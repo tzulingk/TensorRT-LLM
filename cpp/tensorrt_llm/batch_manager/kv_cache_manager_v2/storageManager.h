@@ -49,6 +49,23 @@ using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
 using DropRecorder = std::function<void(std::vector<SharedPtr<Page>> const&, CacheLevel)>;
 
+//! A committed page the cache is about to drop, as reported to a VictimHook.
+struct VictimPage
+{
+    //! Radix-tree key of the block holding the page.
+    Digest blockKey;
+    LifeCycleId lifeCycle;
+    //! The page's slot in the base page index space a request's page table uses.
+    int pageIndex;
+    //! Tokens of the block the page covers; a full page covers tokensPerBlock.
+    int numTokens;
+};
+
+//! Told about committed pages before they leave the cache hierarchy, with the level they leave
+//! from. Their bytes are complete when it is called and valid only until it returns: the slots are
+//! handed to their next owners right after, so a hook that keeps a page copies it synchronously.
+using VictimHook = std::function<void(CacheLevel, std::vector<VictimPage> const&)>;
+
 // Immutable bidirectional mapping between lifecycles and pool groups.
 class LifeCyclePoolGroupMapping
 {
@@ -184,6 +201,10 @@ public:
     // Force-evict pages from a level to free space.
     void forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,
         DropRecorder const& dropRecorder = {});
+
+    //! Install the hook told about committed pages before eviction drops them, or clear it with an
+    //! empty one. Clearing reusable blocks does not call it.
+    void setVictimHook(VictimHook hook);
 
     // Dynamic cache level resizing.
     void adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
@@ -465,7 +486,11 @@ private:
         return level == kHotLevel ? mHotPoolGroupMapping : mColdPoolGroupMapping;
     }
 
+    //! Report to mVictimHook every committed page at `level` that dropping `evicted` releases.
+    void reportVictims(CacheLevel level, std::vector<Page*> const& evicted) const;
+
     LifeCycleRegistry const& mLifeCycles;
+    VictimHook mVictimHook;
     std::shared_ptr<EventSink> mEventSink;
     Priority mColdTierOffloadMinPriority;
     LifeCyclePoolGroupMapping mHotPoolGroupMapping;

@@ -1693,6 +1693,18 @@ class KVCacheManager:
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
     def clear_reusable_blocks(self) -> None: ...
+    def set_victim_hook(
+        self, hook: Callable[[int, list[tuple[bytes, int, int, int]]], None] | None
+    ) -> None:
+        """Have ``hook(cache_level, pages)`` see each committed page before eviction drops it.
+
+        ``pages`` lists ``(block_key, life_cycle_id, page_index, num_tokens)``. The hook runs
+        inside the eviction, under the manager's lock, with the pages' bytes complete, and must
+        copy any page it keeps before returning: the slots go to their next owners right after.
+        Dropping a page of a block that reuse needs whole also drops the block's subtree, whose
+        pages are reported in the same call. ``None`` removes the hook. Clearing reusable
+        blocks does not call it.
+        """
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
     ) -> MemAddress: ...
