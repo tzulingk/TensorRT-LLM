@@ -4449,6 +4449,23 @@
       "additionalProperties": false,
       "description": "How this server joins a Mooncake store pool.\n\nThe settings every participant shares come from the master named by\n`pool`; what is left here is per-server. Setting this makes\n`trtllm-serve` render the Mooncake client config and export\n`MOONCAKE_CONFIG_PATH`; an inherited `MOONCAKE_CONFIG_PATH` wins.",
       "properties": {
+        "exclusive_remove_delay_s": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Under save_policy 'exclusive', seconds a page loaded from the pool stays there before it is removed. The master refuses the removal until the object lease the load took expires, so this should exceed that lease. Defaults to the lease the pool manifest states plus 1s, or to Mooncake's default 5s lease plus 1s when the manifest states none. The TRTLLM_MOONCAKE_STORE_EXCLUSIVE_REMOVE_DELAY_S environment variable overrides it.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Exclusive Remove Delay S"
+        },
         "local_hostname": {
           "anyOf": [
             {
@@ -4527,6 +4544,19 @@
             "exclude": true
           },
           "title": "Run Dir"
+        },
+        "save_policy": {
+          "default": "write_through",
+          "description": "When a page is written to the pool. 'write_through' writes each block as soon as it is computed, so the pool also holds copies of pages still on a GPU. 'exclusive' writes a page only when the GPU KV cache evicts it and removes a page from the pool once it is loaded back, so the pool holds what the GPUs do not. Pools written under the two policies do not share pages.",
+          "enum": [
+            "write_through",
+            "exclusive"
+          ],
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Save Policy",
+          "type": "string"
         },
         "segment_size": {
           "anyOf": [
