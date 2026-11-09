@@ -423,6 +423,7 @@ def _client_config(
         "role": StoreRole(pool.role).value,
         "transfer_batch_size": pool.transfer_batch_size,
         "stage_through_host": pool.stage_through_host,
+        "save_policy": pool.save_policy,
     }
     return config
 

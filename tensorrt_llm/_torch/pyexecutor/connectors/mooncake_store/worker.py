@@ -37,6 +37,7 @@ buffer registration and no save thread, so a node can lend host memory to the
 pool without an HCA that can pin GPU pages.
 """
 
+import functools
 import threading
 import traceback
 from collections import defaultdict
@@ -53,6 +54,7 @@ from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_address, pool_config
+from .exclusive import VictimWriter
 from .gpudirect import PEERMEM_ENV, allocation_range, format_diagnosis, select_registration_path
 from .keys import KeyNamespace
 from .ledger import record_segment
@@ -240,6 +242,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # `register_kv_cache_layout`. A failure inside the loop is dropped
         # there instead.
         self._save_startup_error: Optional[BaseException] = None
+        # The exclusive policy's writer, its staging, and the managers whose
+        # victim hook feeds it; see `attach_kv_cache_managers`.
+        self._victims: Optional[VictimWriter] = None
+        self._victim_staging: Optional[HostStagingPool] = None
+        self._victim_sources: List[object] = []
 
         global _LOCAL_WORKER
         _LOCAL_WORKER = self
@@ -326,7 +333,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 for rank in range(self._world_size)
             )
 
-        if self._config.role.saves:
+        if self._config.role.saves and not self._config.exclusive:
             self._save_thread = threading.Thread(
                 target=self._drain_saves,
                 name=f"mooncake-store-save-{self._rank}",
@@ -431,7 +438,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 store=self._store,
                 label="load",
             )
-        if self._config.role.saves:
+        if self._config.role.saves and not self._config.exclusive:
             self._save_staging = HostStagingPool(
                 slot_bytes=slot_bytes,
                 num_slots=num_slots,
@@ -458,6 +465,41 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             tokens_per_block=self._addressing.tokens_per_block,
             bytes_per_page=bytes_per_page,
         )
+
+    def attach_kv_cache_managers(self, managers) -> None:
+        """Under the exclusive policy, write each page the GPU cache drops.
+
+        Each manager's victim hook copies a dropped page into victim staging
+        before its slot is reused, and `VictimWriter` writes it to the pool.
+        """
+        if not (self._config.exclusive and self._config.role.saves):
+            return
+        if self._addressing is None:
+            raise RuntimeError("KV cache layout has not been registered")
+        max_bytes_per_page = max(
+            self._addressing.bytes_per_page(layer_group_id)
+            for layer_group_id in self._addressing.layer_group_ids
+        )
+        self._victim_staging = HostStagingPool(
+            slot_bytes=max_bytes_per_page,
+            num_slots=max(1, self._config.victim_staging_bytes // max_bytes_per_page),
+            store=self._store,
+            label="victim",
+        )
+        self._victims = VictimWriter(
+            store=self._store,
+            addressing=self._addressing,
+            namespaces=self._namespaces,
+            staging=self._victim_staging,
+            batch_size=self._config.transfer_batch_size,
+            remove_delay_s=self._config.exclusive_remove_delay_s,
+            max_wait_s=self._config.victim_max_wait_s,
+            rank=self._rank,
+            device_index=self._device_index,
+        )
+        for manager, group_offset in managers:
+            manager.set_victim_hook(functools.partial(self._victims.on_victims, group_offset))
+            self._victim_sources.append(manager)
 
     # ---- leader-facing lookup ----
 
@@ -582,6 +624,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 # The next batch reuses the slots and the forward pass reads
                 # these pages, so the scatter has to complete before either.
                 _sync_stream(handle)
+            if self._victims is not None:
+                # The page is on a GPU again, so the pool copy is a duplicate.
+                self._victims.schedule_removal(list(batch_keys))
 
         logger.debug(f"mooncake-store rank {self._rank} loaded {total_pages} pages")
 
@@ -778,6 +823,12 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     def shutdown(self) -> None:
         """Stop the save thread, then release what it was reading. Idempotent."""
+        sources, self._victim_sources = self._victim_sources, []
+        for manager in sources:
+            manager.set_victim_hook(None)
+        if self._victims is not None:
+            self._victims.shutdown(timeout=SAVE_DRAIN_TIMEOUT)
+            self._victims = None
         thread = self._save_thread
         if thread is not None:
             self._save_queue.put(None)
@@ -813,6 +864,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # against this memory.
         self._load_staging = None
         self._save_staging = None
+        self._victim_staging = None
         self._save_stream = None
         global _LOCAL_WORKER
         if _LOCAL_WORKER is self:

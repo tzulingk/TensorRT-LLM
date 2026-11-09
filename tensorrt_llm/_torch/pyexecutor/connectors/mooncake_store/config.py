@@ -39,6 +39,7 @@ __all__ = [
     "CONFIG_PATH_ENV",
     "MooncakeStoreConnectorConfig",
     "SEGMENTS_DIR_NAME",
+    "SavePolicy",
     "StoreRole",
     "local_address",
     "parse_size",
@@ -65,6 +66,12 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 #: rendered config so a vLLM reader of the same file sees the same value.
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
 DEFAULT_NAMESPACE = "trtllm"
+#: Pinned host memory the exclusive save policy stages dropped pages through.
+DEFAULT_VICTIM_STAGING_BYTES = 1 << 30
+#: Longer than Mooncake's default 5 s object lease, which a load leaves behind
+#: and which makes a removal before it expires fail.
+DEFAULT_EXCLUSIVE_REMOVE_DELAY_S = 6.0
+DEFAULT_VICTIM_MAX_WAIT_S = 1.0
 #: Mooncake's peer-to-peer handshake, which keeps a separate metadata process
 #: out of the deployment. An empty connstring is not a form `store.setup`
 #: accepts, so this is the only sensible fallback.
@@ -201,6 +208,19 @@ class StoreRole(Enum):
         return self.loads or self.saves
 
 
+class SavePolicy(Enum):
+    """When a page is written to the pool.
+
+    `write_through` writes each block as soon as it is computed, so the pool
+    also holds copies of pages still on a GPU. `exclusive` writes a page only
+    when the GPU cache drops it, and removes a page from the pool once it is
+    loaded back, so the pool holds what the GPUs do not; see `exclusive.py`.
+    """
+
+    WRITE_THROUGH = "write_through"
+    EXCLUSIVE = "exclusive"
+
+
 def parse_size(value: Any, *, strict_units: bool = False) -> int:
     """Accept either a byte count or a suffixed string such as `"4GiB"`.
 
@@ -290,6 +310,17 @@ class MooncakeStoreConnectorConfig:
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
     #: RDMA, which registering device memory requires.
     stage_through_host: bool = False
+    #: When a page is written to the pool; see `SavePolicy`.
+    save_policy: SavePolicy = SavePolicy.WRITE_THROUGH
+    #: Pinned host memory the exclusive policy copies dropped pages into before
+    #: writing them, since their GPU slots are reused right away.
+    victim_staging_bytes: int = DEFAULT_VICTIM_STAGING_BYTES
+    #: Seconds a loaded page stays in the pool before the exclusive policy
+    #: removes it; see `DEFAULT_EXCLUSIVE_REMOVE_DELAY_S`.
+    exclusive_remove_delay_s: float = DEFAULT_EXCLUSIVE_REMOVE_DELAY_S
+    #: Seconds eviction may wait for a free victim staging slot before the
+    #: page is dropped rather than written.
+    victim_max_wait_s: float = DEFAULT_VICTIM_MAX_WAIT_S
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -301,6 +332,17 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("global_segment_size must be >= 0")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
+        if self.victim_staging_bytes <= 0:
+            raise ValueError("victim_staging_bytes must be > 0")
+        if self.exclusive_remove_delay_s < 0:
+            raise ValueError("exclusive_remove_delay_s must be >= 0")
+        if self.victim_max_wait_s < 0:
+            raise ValueError("victim_max_wait_s must be >= 0")
+
+    @property
+    def exclusive(self) -> bool:
+        """Whether pages reach the pool only when the GPU cache drops them."""
+        return self.save_policy is SavePolicy.EXCLUSIVE
 
     @property
     def capacity_only(self) -> bool:
@@ -318,6 +360,14 @@ class MooncakeStoreConnectorConfig:
         except ValueError as exc:
             known = ", ".join(member.value for member in StoreRole)
             raise ValueError(f"role={role!r} in {path} is not one of: {known}") from exc
+        save_policy = str(raw.get("save_policy", SavePolicy.WRITE_THROUGH.value)).strip().lower()
+        try:
+            parsed_save_policy = SavePolicy(save_policy)
+        except ValueError as exc:
+            known = ", ".join(member.value for member in SavePolicy)
+            raise ValueError(
+                f"save_policy={save_policy!r} in {path} is not one of: {known}"
+            ) from exc
         return MooncakeStoreConnectorConfig(
             master_server_address=raw.get("master_server_address", ""),
             metadata_server=raw.get("metadata_server") or DEFAULT_METADATA_SERVER,
@@ -336,6 +386,14 @@ class MooncakeStoreConnectorConfig:
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             stage_through_host=bool(raw.get("stage_through_host", False)),
+            save_policy=parsed_save_policy,
+            victim_staging_bytes=parse_size(
+                raw.get("victim_staging_bytes", DEFAULT_VICTIM_STAGING_BYTES), strict_units=True
+            ),
+            exclusive_remove_delay_s=float(
+                raw.get("exclusive_remove_delay_s", DEFAULT_EXCLUSIVE_REMOVE_DELAY_S)
+            ),
+            victim_max_wait_s=float(raw.get("victim_max_wait_s", DEFAULT_VICTIM_MAX_WAIT_S)),
         )
 
     @staticmethod

@@ -2785,6 +2785,15 @@ class MooncakeStoreConfig(StrictBaseModel):
         "registering the KV pools with Mooncake. For a host whose HCA cannot "
         "pin GPU pages; costs a copy each way. Ignored when role is "
         "'capacity'.")
+    save_policy: Literal["write_through", "exclusive"] = Field(
+        "write_through",
+        telemetry=False,
+        description="When a page is written to the pool. 'write_through' "
+        "writes each block as soon as it is computed, so the pool also holds "
+        "copies of pages still on a GPU. 'exclusive' writes a page only when "
+        "the GPU KV cache evicts it and removes a page from the pool once it "
+        "is loaded back, so the pool holds what the GPUs do not. Pools "
+        "written under the two policies do not share pages.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,

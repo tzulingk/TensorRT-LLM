@@ -24,7 +24,7 @@ do the moving. That needs two pieces of per-request bookkeeping:
   allocated before it is full and is savable only once it is full.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -94,6 +94,23 @@ def _reuse_scope(request: LlmRequest) -> Optional[ReuseScope]:
     return ReuseScope(cache_salt=request.cache_salt, multimodal_digests=digests)
 
 
+class _FixedKeys:
+    """Block keys computed once, in place of a hash chain nothing extends.
+
+    Under the exclusive policy the pool is keyed by radix-tree block keys and
+    the leader only reads the prompt's, for lookups and loads, so nothing grows
+    them as the request generates.
+    """
+
+    __slots__ = ("hashes",)
+
+    def __init__(self, hashes: Sequence[bytes]) -> None:
+        self.hashes = list(hashes)
+
+    def extend(self, tokens: Sequence[int]) -> Sequence[bytes]:
+        return self.hashes
+
+
 class _RequestState:
     """Per-request bookkeeping that has to outlive a single iteration."""
 
@@ -132,11 +149,21 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
         self._requests: Dict[int, _RequestState] = {}
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
+        # Under the exclusive policy the worker writes pages as the GPU cache
+        # drops them, named by their radix-tree keys, and this is where the
+        # leader gets the same keys for a request; see
+        # `attach_kv_cache_managers`.
+        self._block_keys: Optional[Callable[[LlmRequest], List[bytes]]] = None
 
         logger.warning(
             f"mooncake-store leader ready (role={self._config.role.value}, "
             f"tokens_per_block={self._tokens_per_block})"
         )
+
+    def attach_kv_cache_managers(self, managers) -> None:
+        """Under the exclusive policy, name blocks by the target manager's keys."""
+        if self._config.exclusive:
+            self._block_keys = managers[0][0].reuse_block_keys
 
     def wait_for_initialization(self):
         """Bind to the process-local worker, which owns the store handle."""
@@ -240,7 +267,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             # iteration the runtime allocated pages to hold it.
             state.load_blocks = 0
 
-            if self._config.role.saves:
+            if self._config.role.saves and not self._config.exclusive:
                 saves = self._saves_for(state, request_data)
                 if saves.pages:
                     state.emitted_saves = True
@@ -284,7 +311,16 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     ) -> _RequestState:
         state = self._requests.get(request.request_id)
         if state is None:
-            state = _RequestState(BlockHashChain(self._tokens_per_block, scope=scope))
+            if self._config.exclusive:
+                if self._block_keys is None:
+                    raise RuntimeError(
+                        "mooncake-store save_policy=exclusive has no KV cache manager "
+                        "to name blocks by; attach_kv_cache_managers was never called"
+                    )
+                chain = _FixedKeys(self._block_keys(request))
+            else:
+                chain = BlockHashChain(self._tokens_per_block, scope=scope)
+            state = _RequestState(chain)
             self._requests[request.request_id] = state
         # The lookup runs before the request is scheduled, so the chain has to
         # be ready before any scheduler output exists.
