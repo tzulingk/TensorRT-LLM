@@ -30,10 +30,13 @@ only costs a future miss.
 
 Removal after a load is deferred. Mooncake refuses to remove an object while a
 lease from a recent lookup or read is outstanding, and the load that just read
-the page holds one, so removal waits out the lease. If the page is dropped from
-the GPU again before then, the pending removal is cancelled instead of writing
-the page back. A removal Mooncake still refuses is not retried: someone else
-looked the page up and will load it.
+the page holds one, so removal waits out the lease; see
+`config.resolve_exclusive_remove_delay`. If the page is dropped from the GPU
+again before then, the pending removal is cancelled instead of writing the page
+back. A removal Mooncake still refuses, because the lease is longer than
+assumed or someone else read the page since, is tried again a bounded number of
+times, each after twice the previous wait. A page that is already gone counts
+as removed.
 
 Pool keys under this policy are radix-tree block keys rather than the
 connector's own hash chain, since those are the only identity the victim hook
@@ -53,6 +56,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .addressing import PageAddressing
+from .config import EXCLUSIVE_REMOVE_RETRIES
 from .keys import KeyNamespace
 from .staging import HostStagingPool, sync_stream
 
@@ -60,6 +64,10 @@ __all__ = ["ExclusiveStats", "VictimWriter"]
 
 #: Cache level of GPU memory in `KVCacheManagerV2`.
 _GPU_LEVEL = 0
+
+#: What `MooncakeDistributedStore.remove` returns for a key the pool does not
+#: hold (Mooncake's `ErrorCode::OBJECT_NOT_FOUND`).
+_OBJECT_NOT_FOUND = -704
 
 #: Seconds between two statistics lines.
 _STATS_INTERVAL = 60.0
@@ -85,7 +93,14 @@ class ExclusiveStats:
     put_failed: int = 0
     #: Pages removed from the pool after a load.
     removed: int = 0
-    #: Removals the pool refused, usually for a lease someone else holds.
+    #: Removals that found the page already gone, evicted by the master or
+    #: removed by another rank that loaded it too.
+    remove_absent: int = 0
+    #: Removals the pool refused, usually for an unexpired lease, and that were
+    #: scheduled again.
+    remove_retried: int = 0
+    #: Removals given up on after the pool refused every try, each leaving a
+    #: duplicate of a GPU page in the pool.
     remove_failed: int = 0
 
     def line(self) -> str:
@@ -118,6 +133,7 @@ class VictimWriter:
         max_wait_s: float,
         rank: int,
         device_index: Optional[int],
+        remove_retries: int = EXCLUSIVE_REMOVE_RETRIES,
     ) -> None:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
@@ -125,12 +141,15 @@ class VictimWriter:
             raise ValueError(f"remove_delay_s must be >= 0, got {remove_delay_s}")
         if max_wait_s < 0:
             raise ValueError(f"max_wait_s must be >= 0, got {max_wait_s}")
+        if remove_retries < 0:
+            raise ValueError(f"remove_retries must be >= 0, got {remove_retries}")
         self._store = store
         self._addressing = addressing
         self._namespaces = dict(namespaces)
         self._staging = staging
         self._batch_size = int(batch_size)
         self._remove_delay_s = float(remove_delay_s)
+        self._remove_retries = int(remove_retries)
         self._max_wait_s = float(max_wait_s)
         self._rank = rank
         self._tokens_per_block = addressing.tokens_per_block
@@ -139,9 +158,10 @@ class VictimWriter:
         self._free_slots: List[int] = list(range(staging.num_slots))
         #: Keys staged and not yet written, so a second report of one is ignored.
         self._queued: Set[str] = set()
-        #: Key -> due time of its removal. A heap entry whose due time no longer
-        #: matches was cancelled.
-        self._pending_removals: Dict[str, float] = {}
+        #: Key -> (due time, tries the pool already refused) of its removal. A
+        #: heap entry whose due time no longer matches was cancelled or
+        #: rescheduled.
+        self._pending_removals: Dict[str, Tuple[float, int]] = {}
         self._removal_heap: List[Tuple[float, str]] = []
         self._stats = ExclusiveStats()
         self._stats_since = time.monotonic()
@@ -160,7 +180,8 @@ class VictimWriter:
         logger.info(
             f"mooncake-store rank {rank}: exclusive save policy, "
             f"{staging.num_slots} victim staging slots of {staging.slot_bytes} B, "
-            f"removal after {remove_delay_s:g}s, wait for a slot up to {max_wait_s:g}s"
+            f"removal after {remove_delay_s:g}s with up to {remove_retries} retries, "
+            f"wait for a slot up to {max_wait_s:g}s"
         )
 
     # ---- executor side ----
@@ -233,7 +254,7 @@ class VictimWriter:
             for key in keys:
                 if key in self._queued:
                     continue
-                self._pending_removals[key] = due
+                self._pending_removals[key] = (due, 0)
                 heapq.heappush(self._removal_heap, (due, key))
         # Wake the writer, which may be sleeping past this due time.
         self._queue.put([])
@@ -323,23 +344,45 @@ class VictimWriter:
 
     def _remove_due(self) -> None:
         now = time.monotonic()
-        due: List[str] = []
+        due: List[Tuple[str, int]] = []
         with self._lock:
             while self._removal_heap and self._removal_heap[0][0] <= now:
                 when, key = heapq.heappop(self._removal_heap)
-                if self._pending_removals.get(key) == when:
+                pending = self._pending_removals.get(key)
+                if pending is not None and pending[0] == when:
                     del self._pending_removals[key]
-                    due.append(key)
-        removed = failed = 0
-        for key in due:
-            if self._store.remove(key) == 0:
+                    due.append((key, pending[1]))
+        if not due:
+            return
+        removed = absent = 0
+        refused: List[Tuple[str, int]] = []
+        for key, refusals in due:
+            result = self._store.remove(key)
+            if result == 0:
                 removed += 1
+            elif result == _OBJECT_NOT_FOUND:
+                absent += 1
             else:
-                failed += 1
-        if due:
-            with self._lock:
-                self._stats.removed += removed
-                self._stats.remove_failed += failed
+                refused.append((key, refusals + 1))
+        retried = failed = 0
+        with self._lock:
+            now = time.monotonic()
+            for key, refusals in refused:
+                if key in self._pending_removals or key in self._queued:
+                    # Loaded again, or dropped again, while the removal was in
+                    # flight: whatever that scheduled supersedes this try.
+                    continue
+                if refusals > self._remove_retries:
+                    failed += 1
+                    continue
+                when = now + self._remove_delay_s * (1 << refusals)
+                self._pending_removals[key] = (when, refusals)
+                heapq.heappush(self._removal_heap, (when, key))
+                retried += 1
+            self._stats.removed += removed
+            self._stats.remove_absent += absent
+            self._stats.remove_retried += retried
+            self._stats.remove_failed += failed
 
     def _maybe_log_stats(self) -> None:
         now = time.monotonic()

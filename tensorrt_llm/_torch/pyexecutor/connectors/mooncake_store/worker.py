@@ -53,7 +53,13 @@ from tensorrt_llm.logger import logger
 from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
-from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_address, pool_config
+from .config import (
+    CONFIG_PATH_ENV,
+    MooncakeStoreConnectorConfig,
+    local_address,
+    pool_config,
+    resolve_exclusive_remove_delay,
+)
 from .exclusive import VictimWriter
 from .gpudirect import PEERMEM_ENV, allocation_range, format_diagnosis, select_registration_path
 from .keys import KeyNamespace
@@ -486,13 +492,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             store=self._store,
             label="victim",
         )
+        remove_delay = resolve_exclusive_remove_delay(self._config)
+        remove_delay.log(self._rank)
         self._victims = VictimWriter(
             store=self._store,
             addressing=self._addressing,
             namespaces=self._namespaces,
             staging=self._victim_staging,
             batch_size=self._config.transfer_batch_size,
-            remove_delay_s=self._config.exclusive_remove_delay_s,
+            remove_delay_s=remove_delay.seconds,
             max_wait_s=self._config.victim_max_wait_s,
             rank=self._rank,
             device_index=self._device_index,

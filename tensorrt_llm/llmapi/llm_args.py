@@ -2794,6 +2794,18 @@ class MooncakeStoreConfig(StrictBaseModel):
         "the GPU KV cache evicts it and removes a page from the pool once it "
         "is loaded back, so the pool holds what the GPUs do not. Pools "
         "written under the two policies do not share pages.")
+    exclusive_remove_delay_s: Optional[NonNegativeFloat] = Field(
+        None,
+        telemetry=False,
+        allow_inf_nan=False,
+        description="Under save_policy 'exclusive', seconds a page loaded "
+        "from the pool stays there before it is removed. The master refuses "
+        "the removal until the object lease the load took expires, so this "
+        "should exceed that lease. Defaults to the lease the pool manifest "
+        "states plus 1s, or to Mooncake's default 5s lease plus 1s when the "
+        "manifest states none. The "
+        "TRTLLM_MOONCAKE_STORE_EXCLUSIVE_REMOVE_DELAY_S environment variable "
+        "overrides it.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,

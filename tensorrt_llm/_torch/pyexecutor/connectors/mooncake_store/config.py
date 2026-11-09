@@ -24,12 +24,15 @@ merges the two into the file this reads back.
 """
 
 import json
+import math
 import os
 import re
 import socket
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Tuple
+
+from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig, TorchLlmArgs
@@ -37,7 +40,12 @@ if TYPE_CHECKING:
 __all__ = [
     "CLIENT_CONFIG_NAME",
     "CONFIG_PATH_ENV",
+    "EXCLUSIVE_REMOVE_DELAY_ENV",
+    "EXCLUSIVE_REMOVE_LEASE_MARGIN_S",
+    "EXCLUSIVE_REMOVE_RETRIES",
+    "MOONCAKE_DEFAULT_KV_LEASE_TTL_S",
     "MooncakeStoreConnectorConfig",
+    "RemoveDelay",
     "SEGMENTS_DIR_NAME",
     "SavePolicy",
     "StoreRole",
@@ -45,6 +53,7 @@ __all__ = [
     "parse_size",
     "pool_config",
     "provisioned_config_path",
+    "resolve_exclusive_remove_delay",
     "split_address",
 ]
 
@@ -68,9 +77,19 @@ DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
 DEFAULT_NAMESPACE = "trtllm"
 #: Pinned host memory the exclusive save policy stages dropped pages through.
 DEFAULT_VICTIM_STAGING_BYTES = 1 << 30
-#: Longer than Mooncake's default 5 s object lease, which a load leaves behind
-#: and which makes a removal before it expires fail.
-DEFAULT_EXCLUSIVE_REMOVE_DELAY_S = 6.0
+#: The object lease a `mooncake_master` grants when started without
+#: `--default_kv_lease_ttl` (5000 ms). Every lookup or read of an object leaves
+#: one behind, and the master refuses to remove the object until it expires.
+MOONCAKE_DEFAULT_KV_LEASE_TTL_S = 5.0
+#: How long past the object lease the exclusive policy waits before removing a
+#: page it loaded, so the removal lands after the lease rather than at it.
+EXCLUSIVE_REMOVE_LEASE_MARGIN_S = 1.0
+#: Overrides the exclusive policy's removal delay for the ranks that inherit it,
+#: ahead of `exclusive_remove_delay_s` and the derived default.
+EXCLUSIVE_REMOVE_DELAY_ENV = "TRTLLM_MOONCAKE_STORE_EXCLUSIVE_REMOVE_DELAY_S"
+#: How many more times the exclusive policy tries a removal the pool refused,
+#: waiting twice as long before each, before it leaves the page in the pool.
+EXCLUSIVE_REMOVE_RETRIES = 3
 DEFAULT_VICTIM_MAX_WAIT_S = 1.0
 #: Mooncake's peer-to-peer handshake, which keeps a separate metadata process
 #: out of the deployment. An empty connstring is not a form `store.setup`
@@ -259,6 +278,11 @@ def parse_size(value: Any, *, strict_units: bool = False) -> int:
     return int(float(magnitude) * scale)
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    """`value` as a float, with an absent or null setting left as `None`."""
+    return None if value is None else float(value)
+
+
 def pool_config(llm_args: "TorchLlmArgs") -> Optional["MooncakeStoreConfig"]:
     """The `mooncake_store` block of `llm_args`, if the deployment set one.
 
@@ -316,8 +340,12 @@ class MooncakeStoreConnectorConfig:
     #: writing them, since their GPU slots are reused right away.
     victim_staging_bytes: int = DEFAULT_VICTIM_STAGING_BYTES
     #: Seconds a loaded page stays in the pool before the exclusive policy
-    #: removes it; see `DEFAULT_EXCLUSIVE_REMOVE_DELAY_S`.
-    exclusive_remove_delay_s: float = DEFAULT_EXCLUSIVE_REMOVE_DELAY_S
+    #: removes it. `None` derives it from the object lease; see
+    #: `resolve_exclusive_remove_delay`.
+    exclusive_remove_delay_s: Optional[float] = None
+    #: Object lease, in seconds, of the pool's master, as its manifest states
+    #: it. `None` when the master was started without stating one.
+    kv_lease_ttl_s: Optional[float] = None
     #: Seconds eviction may wait for a free victim staging slot before the
     #: page is dropped rather than written.
     victim_max_wait_s: float = DEFAULT_VICTIM_MAX_WAIT_S
@@ -334,8 +362,14 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("transfer_batch_size must be > 0")
         if self.victim_staging_bytes <= 0:
             raise ValueError("victim_staging_bytes must be > 0")
-        if self.exclusive_remove_delay_s < 0:
-            raise ValueError("exclusive_remove_delay_s must be >= 0")
+        if self.exclusive_remove_delay_s is not None and not (
+            math.isfinite(self.exclusive_remove_delay_s) and self.exclusive_remove_delay_s >= 0
+        ):
+            raise ValueError("exclusive_remove_delay_s must be a finite number >= 0")
+        if self.kv_lease_ttl_s is not None and not (
+            math.isfinite(self.kv_lease_ttl_s) and self.kv_lease_ttl_s > 0
+        ):
+            raise ValueError("kv_lease_ttl_s must be a finite number > 0")
         if self.victim_max_wait_s < 0:
             raise ValueError("victim_max_wait_s must be >= 0")
 
@@ -390,9 +424,8 @@ class MooncakeStoreConnectorConfig:
             victim_staging_bytes=parse_size(
                 raw.get("victim_staging_bytes", DEFAULT_VICTIM_STAGING_BYTES), strict_units=True
             ),
-            exclusive_remove_delay_s=float(
-                raw.get("exclusive_remove_delay_s", DEFAULT_EXCLUSIVE_REMOVE_DELAY_S)
-            ),
+            exclusive_remove_delay_s=_optional_float(raw.get("exclusive_remove_delay_s")),
+            kv_lease_ttl_s=_optional_float(raw.get("kv_lease_ttl_s")),
             victim_max_wait_s=float(raw.get("victim_max_wait_s", DEFAULT_VICTIM_MAX_WAIT_S)),
         )
 
@@ -436,3 +469,106 @@ class MooncakeStoreConnectorConfig:
             f"separates this checkpoint from any other an engine sharing the "
             f"pool might load, rather than one derived from {model!r}."
         )
+
+
+@dataclass(frozen=True)
+class RemoveDelay:
+    """How long the exclusive policy leaves a loaded page in the pool, and why."""
+
+    #: Seconds between a load and the removal of the pages it read.
+    seconds: float
+    #: Where `seconds` came from, for the startup log.
+    source: str
+    #: The object lease `seconds` is measured against.
+    lease_s: float
+    #: Whether `lease_s` is the pool's stated lease rather than Mooncake's
+    #: default assumed for a master that stated none.
+    lease_known: bool
+    #: Whether `seconds` was set rather than derived from the lease.
+    explicit: bool
+
+    @property
+    def warning(self) -> Optional[str]:
+        """What is wrong with a set delay that does not outlast the lease, if it does not."""
+        if not self.explicit or self.seconds > self.lease_s:
+            return None
+        lease = (
+            f"the pool's {self.lease_s:g}s object lease"
+            if self.lease_known
+            else f"Mooncake's default {self.lease_s:g}s object lease, which this pool is "
+            "assumed to have since its manifest states none"
+        )
+        return (
+            f"mooncake-store: the exclusive removal delay of {self.seconds:g}s from "
+            f"{self.source} does not outlast {lease}. The pool refuses to remove a page "
+            f"while the lease its load took is held, so each removal is refused and "
+            f"retried up to {EXCLUSIVE_REMOVE_RETRIES} times at growing intervals; one "
+            f"that is refused every time leaves the page in the pool as a duplicate of "
+            f"the GPU copy. Unset it to derive "
+            f"{self.lease_s + EXCLUSIVE_REMOVE_LEASE_MARGIN_S:g}s from the lease."
+        )
+
+    def log(self, rank: int) -> None:
+        """State the delay and its source, and warn if it does not outlast the lease."""
+        logger.info(
+            f"mooncake-store rank {rank}: exclusive removal delay {self.seconds:g}s, "
+            f"from {self.source}"
+        )
+        warning = self.warning
+        if warning is not None:
+            logger.warning(warning)
+
+
+def resolve_exclusive_remove_delay(
+    config: MooncakeStoreConnectorConfig, environ: Optional[Mapping[str, str]] = None
+) -> RemoveDelay:
+    """The removal delay the exclusive policy runs with.
+
+    `EXCLUSIVE_REMOVE_DELAY_ENV` wins, then the config's
+    `exclusive_remove_delay_s`. Otherwise the delay is the object lease plus
+    `EXCLUSIVE_REMOVE_LEASE_MARGIN_S`: the lease the pool manifest states, or
+    Mooncake's default for a master started without a manifest stating one.
+
+    Args:
+        config: The client config this rank opened.
+        environ: The environment to read the override from; `os.environ` if
+            omitted.
+
+    Raises:
+        ValueError: if the override is not a finite number of seconds >= 0.
+    """
+    environ = os.environ if environ is None else environ
+    lease_known = config.kv_lease_ttl_s is not None
+    lease_s = config.kv_lease_ttl_s if lease_known else MOONCAKE_DEFAULT_KV_LEASE_TTL_S
+
+    override = environ.get(EXCLUSIVE_REMOVE_DELAY_ENV, "").strip()
+    if override:
+        try:
+            seconds = float(override)
+        except ValueError:
+            seconds = math.nan
+        if not (math.isfinite(seconds) and seconds >= 0):
+            raise ValueError(
+                f"{EXCLUSIVE_REMOVE_DELAY_ENV}={override!r} is not a number of seconds >= 0"
+            )
+        return RemoveDelay(seconds, EXCLUSIVE_REMOVE_DELAY_ENV, lease_s, lease_known, True)
+    if config.exclusive_remove_delay_s is not None:
+        return RemoveDelay(
+            config.exclusive_remove_delay_s,
+            "exclusive_remove_delay_s",
+            lease_s,
+            lease_known,
+            True,
+        )
+    lease_source = (
+        "the pool manifest"
+        if lease_known
+        else "Mooncake's default, since the pool manifest states none"
+    )
+    return RemoveDelay(
+        lease_s + EXCLUSIVE_REMOVE_LEASE_MARGIN_S,
+        f"the {lease_s:g}s object lease ({lease_source}) plus {EXCLUSIVE_REMOVE_LEASE_MARGIN_S:g}s",
+        lease_s,
+        lease_known,
+        False,
+    )

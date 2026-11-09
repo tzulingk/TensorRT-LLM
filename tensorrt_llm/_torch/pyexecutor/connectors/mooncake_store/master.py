@@ -30,6 +30,7 @@ exporting `MOONCAKE_CONFIG_PATH` for the ranks the LLM constructor spawns.
 
 import contextlib
 import json
+import math
 import os
 import shutil
 import socket
@@ -48,6 +49,7 @@ from .config import (
     DEFAULT_LOCAL_BUFFER_SIZE,
     DEFAULT_METADATA_SERVER,
     DEFAULT_NAMESPACE,
+    MOONCAKE_DEFAULT_KV_LEASE_TTL_S,
     RUN_DIR_OWNER_NAME,
     StoreRole,
     local_address,
@@ -87,6 +89,20 @@ LOG_TAIL_LINES = 20
 DEFAULT_MASTER_PORT = 50051
 DEFAULT_MASTER_METRICS_PORT = 9004
 DEFAULT_MASTER_EVICTION_RATIO = 0.05
+#: Passed to every master this module starts, so the manifest states the lease
+#: the master really grants rather than whatever its build defaults to.
+DEFAULT_MASTER_KV_LEASE_TTL_S = MOONCAKE_DEFAULT_KV_LEASE_TTL_S
+
+
+def _lease_flag(kv_lease_ttl_s: float) -> str:
+    """`mooncake_master`'s lease flag, which takes whole milliseconds."""
+    lease_ms = round(kv_lease_ttl_s * 1000)
+    if not (math.isfinite(kv_lease_ttl_s) and lease_ms >= 1):
+        raise ValueError(
+            f"kv_lease_ttl_s={kv_lease_ttl_s!r} must be at least 0.001s, the "
+            "master's lease resolution."
+        )
+    return f"--default_kv_lease_ttl={lease_ms}"
 
 
 def _log_tail(path: str, lines: int = LOG_TAIL_LINES) -> str:
@@ -120,6 +136,10 @@ class PoolManifest:
     #: Reported for a reader's benefit rather than used; the master owns them.
     metrics_port: Optional[int] = None
     eviction_ratio: Optional[float] = None
+    #: Seconds of object lease the master grants each lookup or read, during
+    #: which it refuses to remove the object. The exclusive save policy waits
+    #: it out before removing a page it loaded.
+    kv_lease_ttl_s: Optional[float] = None
     #: Anything a newer master published that this reader does not know about,
     #: kept so a round trip through here does not drop it.
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -132,6 +152,7 @@ class PoolManifest:
         "namespace",
         "metrics_port",
         "eviction_ratio",
+        "kv_lease_ttl_s",
     )
 
     def to_json(self) -> Dict[str, Any]:
@@ -148,6 +169,8 @@ class PoolManifest:
             record["metrics_port"] = self.metrics_port
         if self.eviction_ratio is not None:
             record["eviction_ratio"] = self.eviction_ratio
+        if self.kv_lease_ttl_s is not None:
+            record["kv_lease_ttl_s"] = self.kv_lease_ttl_s
         return record
 
     @staticmethod
@@ -166,14 +189,32 @@ class PoolManifest:
             namespace=str(raw.get("namespace", DEFAULT_NAMESPACE)),
             metrics_port=raw.get("metrics_port"),
             eviction_ratio=raw.get("eviction_ratio"),
+            kv_lease_ttl_s=_lease_from_manifest(raw.get("kv_lease_ttl_s"), source),
             extra={k: v for k, v in raw.items() if k not in PoolManifest._KNOWN},
         )
 
     def describe(self) -> str:
+        lease = f" lease={self.kv_lease_ttl_s:g}s" if self.kv_lease_ttl_s is not None else ""
         return (
             f"master={self.master_server_address} protocol={self.protocol} "
-            f"metadata={self.metadata_server} namespace={self.namespace}"
+            f"metadata={self.metadata_server} namespace={self.namespace}{lease}"
         )
+
+
+def _lease_from_manifest(value: Any, source: str) -> Optional[float]:
+    """The manifest's `kv_lease_ttl_s` as seconds, or `None` if it states none."""
+    if value is None:
+        return None
+    try:
+        lease = float(value)
+    except (TypeError, ValueError):
+        lease = math.nan
+    if not (math.isfinite(lease) and lease > 0):
+        raise ValueError(
+            f"The Mooncake pool manifest at {source} states kv_lease_ttl_s="
+            f"{value!r}, which is not a number of seconds > 0."
+        )
+    return lease
 
 
 def _wait_for_manifest(path: str, timeout: float) -> Dict[str, Any]:
@@ -424,6 +465,18 @@ def _client_config(
         "transfer_batch_size": pool.transfer_batch_size,
         "stage_through_host": pool.stage_through_host,
         "save_policy": pool.save_policy,
+        # Omitted unless known or set, so that the ranks derive the removal
+        # delay from the lease, or fall back to Mooncake's default lease.
+        **(
+            {"kv_lease_ttl_s": manifest.kv_lease_ttl_s}
+            if manifest.kv_lease_ttl_s is not None
+            else {}
+        ),
+        **(
+            {"exclusive_remove_delay_s": pool.exclusive_remove_delay_s}
+            if pool.exclusive_remove_delay_s is not None
+            else {}
+        ),
     }
     return config
 
@@ -453,10 +506,12 @@ def _launch_master(
     rpc_port: int = DEFAULT_MASTER_PORT,
     metrics_port: int = DEFAULT_MASTER_METRICS_PORT,
     eviction_ratio: float = DEFAULT_MASTER_EVICTION_RATIO,
+    kv_lease_ttl_s: float = DEFAULT_MASTER_KV_LEASE_TTL_S,
     binary: str = DEFAULT_MASTER_BINARY,
     timeout: float = DEFAULT_MASTER_TIMEOUT,
 ) -> LaunchedMaster:
     """Start a master on this host and wait for it to answer."""
+    lease_flag = _lease_flag(kv_lease_ttl_s)
     resolved = shutil.which(binary)
     if resolved is None:
         raise FileNotFoundError(
@@ -482,6 +537,7 @@ def _launch_master(
         f"--rpc_port={rpc_port}",
         f"--metrics_port={metrics_port}",
         f"--eviction_ratio={eviction_ratio}",
+        lease_flag,
     ]
 
     logger.warning(f"mooncake-store: starting {' '.join(command)} on {host}")
@@ -556,6 +612,7 @@ def running_master(
     rpc_port: int = DEFAULT_MASTER_PORT,
     metrics_port: int = DEFAULT_MASTER_METRICS_PORT,
     eviction_ratio: float = DEFAULT_MASTER_EVICTION_RATIO,
+    kv_lease_ttl_s: float = DEFAULT_MASTER_KV_LEASE_TTL_S,
     metadata_server: str = DEFAULT_METADATA_SERVER,
     protocol: str = "rdma",
     namespace: str = DEFAULT_NAMESPACE,
@@ -574,6 +631,7 @@ def running_master(
         rpc_port=rpc_port,
         metrics_port=metrics_port,
         eviction_ratio=eviction_ratio,
+        kv_lease_ttl_s=kv_lease_ttl_s,
         binary=binary,
         timeout=timeout,
     )
@@ -584,6 +642,7 @@ def running_master(
         namespace=namespace,
         metrics_port=metrics_port,
         eviction_ratio=eviction_ratio,
+        kv_lease_ttl_s=kv_lease_ttl_s,
     )
     try:
         with _published_manifest(manifest, _manifest_paths(run_dir, pool_file)):

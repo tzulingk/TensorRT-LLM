@@ -111,6 +111,17 @@ def _signal_handoff():
     help="Fraction of the pool freed per eviction pass.",
 )
 @click.option(
+    "--kv_lease_ttl_s",
+    type=click.FloatRange(min=0.001),
+    default=5.0,
+    show_default=True,
+    help="Seconds of object lease the master grants each lookup or read, "
+    "passed to it as --default_kv_lease_ttl in milliseconds. The master "
+    "refuses to remove an object until its lease expires. Recorded in the "
+    "manifest so the servers' exclusive save policy waits it out before "
+    "removing a page it loaded.",
+)
+@click.option(
     "--pool_file",
     type=str,
     default=None,
@@ -179,6 +190,7 @@ def mooncake_master(
     rpc_port: int,
     metrics_port: int,
     eviction_ratio: float,
+    kv_lease_ttl_s: float,
     pool_file: Optional[str],
     protocol: str,
     metadata_server: str,
@@ -211,6 +223,7 @@ def mooncake_master(
             rpc_port=rpc_port,
             metrics_port=metrics_port,
             eviction_ratio=eviction_ratio,
+            kv_lease_ttl_s=kv_lease_ttl_s,
             metadata_server=metadata_server,
             protocol=protocol,
             namespace=namespace,
