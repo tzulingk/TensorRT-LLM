@@ -193,6 +193,7 @@ def test_victim_writer_copies_the_page_the_hook_names(writer_factory):
     store = FakeStore()
     writer = writer_factory(store, num_slots=1)
     writer.on_victims(0, 0, [(b"\x01" * 32, 0, 3, TOKENS_PER_BLOCK)])
+    writer.shutdown()
     assert writer._staging.gathered[0] == ((0x1000 + 3 * PAGE_BYTES,), (PAGE_BYTES,))
 
 
@@ -230,6 +231,24 @@ def test_victim_writer_waits_for_a_slot_when_allowed(writer_factory):
     assert writer.stats.dropped == 0
 
 
+def test_one_report_of_more_pages_than_slots_waits_for_the_writer_not_the_timeout(
+    writer_factory,
+):
+    store = FakeStore()
+    writer = writer_factory(store, num_slots=2, max_wait_s=30.0)
+    block_keys = [bytes([i]) * 32 for i in range(1, 8)]
+    started = time.monotonic()
+    writer.on_victims(
+        0, 0, [(block_key, 0, i, TOKENS_PER_BLOCK) for i, block_key in enumerate(block_keys)]
+    )
+    assert time.monotonic() - started < 10.0
+    writer.shutdown()
+    assert store.put_keys == [key(block_key) for block_key in block_keys]
+    stats = writer.stats
+    assert stats.victims == len(block_keys)
+    assert stats.dropped == 0
+
+
 def test_loaded_page_is_removed_after_the_delay(writer_factory):
     store = FakeStore()
     loaded = key(b"\x01" * 32)
@@ -238,6 +257,7 @@ def test_loaded_page_is_removed_after_the_delay(writer_factory):
     writer.schedule_removal([loaded])
     assert store.removed == []
     assert wait_until(lambda: store.removed == [loaded])
+    writer.shutdown()
     assert loaded not in store.objects
 
 
@@ -262,6 +282,7 @@ def test_a_refused_removal_is_retried_until_it_succeeds(writer_factory):
     writer = writer_factory(store, remove_delay_s=0.01)
     writer.schedule_removal([leased])
     assert wait_until(lambda: store.removed == [leased])
+    writer.shutdown()
     assert store.remove_calls == [leased] * 3
     stats = writer.stats
     assert (stats.removed, stats.remove_retried, stats.remove_failed) == (1, 2, 0)
@@ -295,6 +316,7 @@ def test_retries_wait_twice_as_long_each_time(writer_factory):
     assert wait_until(lambda: len(store.remove_calls) == 1)
     with writer._lock:
         due, refusals = writer._pending_removals[leased]
+    writer.shutdown()
     assert refusals == 1
     # The first try ran after 0.2s; the retry waits 2 x 0.2s more.
     assert due - scheduled >= 0.2 + 0.4 - 0.05

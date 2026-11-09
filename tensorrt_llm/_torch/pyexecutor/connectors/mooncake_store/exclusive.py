@@ -25,8 +25,10 @@ A page about to be dropped is reported through the manager's victim hook, from
 inside the eviction that frees it. Its slot goes to a new owner as soon as the
 hook returns, so the hook copies the page into a pinned staging slot right
 away and a background thread writes the slot to the pool later. When no slot
-is free the hook waits for one, up to a bound, and then drops the page, which
-only costs a future miss.
+is free the hook hands the thread the pages it staged so far, since only the
+thread frees slots, and waits for one, up to a bound; then it drops the page,
+which only costs a future miss. An eviction can therefore drop more pages than
+there are slots without waiting on itself.
 
 Removal after a load is deferred. Mooncake refuses to remove an object while a
 lease from a recent lookup or read is outstanding, and the load that just read
@@ -71,6 +73,9 @@ _OBJECT_NOT_FOUND = -704
 
 #: Seconds between two statistics lines.
 _STATS_INTERVAL = 60.0
+
+#: What `VictimWriter._claim_slot` returns when every staging slot is taken.
+_NO_FREE_SLOT = -1
 
 
 @dataclass
@@ -212,20 +217,30 @@ class VictimWriter:
                 continue
             key = namespace.key(bytes(block_key))
             slot = self._claim_slot(key)
+            if slot == _NO_FREE_SLOT:
+                # Only the writer frees slots, and only those of pages it was
+                # handed, so hand it what this call staged before waiting.
+                self._hand_over(staged, handle)
+                staged = []
+                slot = self._wait_for_slot(key)
             if slot is None:
                 continue
             addresses, sizes = self._addressing.buffers(layer_group_id, int(page_index))
             _, total = self._staging.gather(slot, addresses, sizes, handle)
             staged.append((key, slot, total))
+        self._hand_over(staged, handle)
+
+    def _hand_over(self, staged: List[Tuple[str, int, int]], handle: int) -> None:
+        """Queue `staged` for the writer once their copies into staging landed."""
         if not staged:
             return
         if self._stream is not None:
-            # The slot is the page's only copy once this returns.
+            # The slot is the page's only copy once the hook returns.
             sync_stream(handle)
         self._queue.put(staged)
 
     def _claim_slot(self, key: str) -> Optional[int]:
-        """A free staging slot for `key`, or None when it needs none or got none."""
+        """A free staging slot for `key`, None when it needs none, or `_NO_FREE_SLOT`."""
         with self._lock:
             self._stats.victims += 1
             if self._pending_removals.pop(key, None) is not None:
@@ -235,10 +250,22 @@ class VictimWriter:
                 return None
             if key in self._queued:
                 return None
+            if not self._free_slots:
+                return _NO_FREE_SLOT
+            self._queued.add(key)
+            return self._free_slots.pop()
+
+    def _wait_for_slot(self, key: str) -> Optional[int]:
+        """Wait up to `max_wait_s` for a staging slot for `key`, or None after dropping it."""
+        with self._lock:
             if not self._free_slots and self._max_wait_s > 0:
                 started = time.monotonic()
                 self._lock.wait_for(lambda: bool(self._free_slots), timeout=self._max_wait_s)
                 self._stats.wait_s += time.monotonic() - started
+            if self._pending_removals.pop(key, None) is not None:
+                # Loaded by another thread during the wait: as in `_claim_slot`.
+                self._stats.kept += 1
+                return None
             if not self._free_slots:
                 self._stats.dropped += 1
                 return None
